@@ -1,6 +1,5 @@
 #include "nkgt/renderer.hpp"
 
-#include <fstream>
 #include <print>
 
 #define WIN32_LEAN_AND_MEAN
@@ -439,39 +438,45 @@ auto Motorino::Engine::create_pipeline(
         return std::unexpected(Error::shader_compilation);
     }
 
-    std::size_t max_file_size = 0;
-    for (const auto& [_, path] : shaders) {
-        if (!std::filesystem::exists(path)) {
-            std::print("Shader file not found. Skipping. Path: {}\n", path.string());
-            continue;
-        }
-
-        std::size_t new_size = std::filesystem::file_size(path);
-        if (new_size > max_file_size) max_file_size = new_size;
-    }
-
-    std::vector<char> buffer(max_file_size);
+    char buffer[2048];
     std::vector<VkShaderModule> shader_modules(shaders.size());
     std::vector<VkPipelineShaderStageCreateInfo> shader_stages;
     shader_stages.reserve(shaders.size());
 
     for(std::size_t i = 0; i < shaders.size(); ++i) {
-        std::ifstream shader(shaders[i].path, std::ios::binary);
+        HANDLE file = CreateFile(
+            shaders[i].path,
+            GENERIC_READ,
+            0,
+            0,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0
+        );
 
-        if (!shader) continue;
+        if (file == INVALID_HANDLE_VALUE) {
+            std::print("Failed to open shader file. Skipping. Path: {}", shaders[i].path);
+            continue;
+        }
 
-        std::size_t code_size = std::filesystem::file_size(shaders[i].path);
-        shader.read(buffer.data(), code_size);
-        std::print("Read {}B from {}.\n", code_size, shaders[i].path.string());
+        //std::size_t code_size = static_cast<std::size_t>(shader.tellg());
+        unsigned long code_size = 0;
+
+        if (ReadFile(file, buffer, 2048, &code_size, 0) == 0) {
+            std::print("Failed to read shader file. Skipping. Path: {}", shaders[i].path);
+            continue;
+        }
+
+        std::print("Read {}B from {}.\n", code_size, shaders[i].path);
 
         VkShaderModuleCreateInfo module_info{
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .codeSize = code_size,
-            .pCode = reinterpret_cast<const std::uint32_t*>(buffer.data())
+            .pCode = reinterpret_cast<const std::uint32_t*>(buffer)
         };
 
         if (vkCreateShaderModule(_device, &module_info, nullptr, &shader_modules[i]) != VK_SUCCESS) {
-            std::print("Failed to create shader module for shader: {}\n", shaders[i].path.string());
+            std::print("Failed to create shader module for shader: {}\n", shaders[i].path);
             return std::unexpected(Error::shader_compilation);
         }
 
@@ -481,6 +486,8 @@ auto Motorino::Engine::create_pipeline(
             .module = shader_modules[i],
             .pName = "main"
         });
+
+        CloseHandle(file);
     }
 
     constexpr VkPipelineVertexInputStateCreateInfo vertex_info{

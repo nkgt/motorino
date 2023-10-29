@@ -1,7 +1,6 @@
 #pragma once
 
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <span>
 #include <vector>
@@ -42,7 +41,7 @@ enum class ShaderStage {
 
 struct ShaderInfo {
     ShaderStage type;
-    std::filesystem::path path;
+    const char* path;
 };
 
 constexpr std::uint32_t max_frames_in_flight = 2;
