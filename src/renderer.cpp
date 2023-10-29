@@ -110,6 +110,12 @@ static auto find_queue_indices(
     return indices;
 }
 
+static void resize_callback(GLFWwindow* window, int width, int height) {
+    Motorino::Engine* engine = reinterpret_cast<Motorino::Engine*>(glfwGetWindowUserPointer(window));
+    engine->set_extent(width, height);
+    engine->recreate_swapchain();
+}
+
 Motorino::Engine::Engine(
     std::uint32_t width,
     std::uint32_t height,
@@ -124,7 +130,14 @@ Motorino::Engine::Engine(
     _graphics_queue{ VK_NULL_HANDLE },
     _present_queue{ VK_NULL_HANDLE },
     _swapchain{ VK_NULL_HANDLE },
-    _pipeline_layout{ VK_NULL_HANDLE }
+    _render_pass{ VK_NULL_HANDLE },
+    _command_pool{ VK_NULL_HANDLE },
+    _pipeline_layout{ VK_NULL_HANDLE },
+    _command_buffers{},
+    _pipeline{ VK_NULL_HANDLE },
+    _image_available_semaphores{},
+    _render_finished_semaphores{},
+    _inflight_fences{}
 #ifndef NDEBUG
     , _dbg_messenger{ VK_NULL_HANDLE }
 #endif
@@ -134,9 +147,10 @@ Motorino::Engine::Engine(
 #endif
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
     _handle = glfwCreateWindow(_width, _height, _name, nullptr, nullptr);
+    glfwSetWindowUserPointer(_handle, this);
+    glfwSetFramebufferSizeCallback(_handle, resize_callback);
 
     std::print("GLFW window created.\n");
 }
@@ -252,7 +266,7 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
     }
 
     std::print(
-        "Surfaces count: {} (graphics: {}, present: {})\n",
+        "Queue count: {} (graphics: {}, present: {})\n",
         queue_count,
         *_indices.graphics,
         *_indices.present
@@ -281,82 +295,8 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
 
     std::print("Created Vulkan logical device.\n");
 
-    VkSurfaceCapabilitiesKHR surface_capabilities;
-
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-        _physical_device,
-        _surface,
-        &surface_capabilities
-    );
-
-    bool should_clamp = surface_capabilities.maxImageCount > 0 &&
-        surface_capabilities.minImageCount + 1 > surface_capabilities.maxImageCount;
-
-    std::uint32_t image_count = should_clamp ? surface_capabilities.maxImageCount :
-                                               surface_capabilities.minImageCount + 1;
-
-    std::uint32_t index_values[] = { *_indices.graphics, *_indices.present };
-
-    VkSwapchainCreateInfoKHR swapchain_info{
-        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface = _surface,
-        .minImageCount = image_count,
-        .imageFormat = VK_FORMAT_R8G8B8A8_SRGB,
-        .imageColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR,
-        .imageExtent = surface_capabilities.currentExtent,
-        .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        .preTransform = surface_capabilities.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
-        .clipped = VK_TRUE,
-        .oldSwapchain = VK_NULL_HANDLE
-    };
-
-    if (index_values[0] != index_values[1]) {
-        swapchain_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-        swapchain_info.queueFamilyIndexCount = 2;
-        swapchain_info.pQueueFamilyIndices = index_values;
-    }
-
-    if (vkCreateSwapchainKHR(_device, &swapchain_info, nullptr, &_swapchain) != VK_SUCCESS) {
-        std::print("Failed to create Vulkan swapchain.\n");
-        return std::unexpected(Error::vulkan);
-    }
-
-    vkGetSwapchainImagesKHR(_device, _swapchain, &image_count, nullptr);
-    
-    _images.resize(image_count);
-    vkGetSwapchainImagesKHR(_device, _swapchain, &image_count, _images.data());
-
-    std::print(
-        "Created Vulkan swapchain ({},{},{}).\n",
-        surface_capabilities.currentExtent.width,
-        surface_capabilities.currentExtent.height,
-        image_count
-    );
-
-    _image_views.resize(_images.size());
-
-    VkImageViewCreateInfo view_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_SRGB,
-        .components = { VK_COMPONENT_SWIZZLE_IDENTITY,
-                        VK_COMPONENT_SWIZZLE_IDENTITY,
-                        VK_COMPONENT_SWIZZLE_IDENTITY,
-                        VK_COMPONENT_SWIZZLE_IDENTITY },
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
-    };
-
-    for (std::size_t i = 0; i < _images.size(); ++i) {
-        view_info.image = _images[i];
-
-        if (vkCreateImageView(_device, &view_info, nullptr, &_image_views[i]) != VK_SUCCESS) {
-            std::print("Failed to obtain Vulkan image view.\n");
-            return std::unexpected(Error::vulkan);
-        }
-    }
+    if (const auto r = create_swapchain(); !r) return r;
+    if (const auto r = create_image_views(); !r) return r;
 
     constexpr VkAttachmentDescription color_attachment{
         .format = VK_FORMAT_R8G8B8A8_SRGB,
@@ -406,26 +346,7 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
 
     std::print("Created Vulkan render pass.\n");
 
-    _framebuffers.resize(_images.size());
-
-    for (std::size_t i = 0; i < _image_views.size(); ++i) {
-        VkFramebufferCreateInfo framebuffer_info{
-            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .renderPass = _render_pass,
-            .attachmentCount = 1,
-            .pAttachments = &_image_views[i],
-            .width = _width,
-            .height = _height,
-            .layers = 1
-        };
-
-        if (vkCreateFramebuffer(_device, &framebuffer_info, nullptr, &_framebuffers[i]) != VK_SUCCESS) {
-            std::print("Failed to create Vulkan framebuffer.\n");
-            return std::unexpected(Error::vulkan);
-        }
-    }
-
-    std::print("Created {} framebuffers.\n", _framebuffers.size());
+    if (const auto r = create_framebuffers(); !r) return r;
 
     VkCommandPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -444,10 +365,10 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = _command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
+        .commandBufferCount = max_frames_in_flight,
     };
 
-    if (vkAllocateCommandBuffers(_device, &alloc_info, &_command_buffer) != VK_SUCCESS) {
+    if (vkAllocateCommandBuffers(_device, &alloc_info, _command_buffers) != VK_SUCCESS) {
         std::print("Failed to allocate command buffer.\n");
         return std::unexpected(Error::vulkan);
     }
@@ -463,19 +384,21 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
         .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     };
 
-    if (vkCreateSemaphore(_device, &semaphore_info, nullptr, &_image_available_semaphore) != VK_SUCCESS) {
-        std::print("Failed to create image_available semaphore.\n");
-        return std::unexpected(Error::vulkan);
-    }
+    for (std::uint32_t i = 0; i < max_frames_in_flight; ++i) {
+        if (vkCreateSemaphore(_device, &semaphore_info, nullptr, &_image_available_semaphores[i]) != VK_SUCCESS) {
+            std::print("Failed to create image_available semaphore.\n");
+            return std::unexpected(Error::vulkan);
+        }
 
-    if (vkCreateSemaphore(_device, &semaphore_info, nullptr, &_render_finished_semaphore) != VK_SUCCESS) {
-        std::print("Failed to create render_finished semaphore.\n");
-        return std::unexpected(Error::vulkan);
-    }
+        if (vkCreateSemaphore(_device, &semaphore_info, nullptr, &_render_finished_semaphores[i]) != VK_SUCCESS) {
+            std::print("Failed to create render_finished semaphore.\n");
+            return std::unexpected(Error::vulkan);
+        }
 
-    if (vkCreateFence(_device, &fence_info, nullptr, &_inflight_fence) != VK_SUCCESS) {
-        std::print("Failed to create inflight fence.\n");
-        return std::unexpected(Error::vulkan);
+        if (vkCreateFence(_device, &fence_info, nullptr, &_inflight_fences[i]) != VK_SUCCESS) {
+            std::print("Failed to create inflight fence.\n");
+            return std::unexpected(Error::vulkan);
+        }
     }
 
     std::print("Created synchronization primitives.\n");
@@ -484,24 +407,20 @@ auto Motorino::Engine::init_vulkan() -> std::expected<void, Error> {
 }
 
 Motorino::Engine::~Engine() {
-    vkDestroySemaphore(_device, _image_available_semaphore, nullptr);
-    vkDestroySemaphore(_device, _render_finished_semaphore, nullptr);
-    vkDestroyFence(_device, _inflight_fence, nullptr);
-    vkDestroyCommandPool(_device, _command_pool, nullptr);
+    cleanup_swapchain();
 
-    for (auto buffer : _framebuffers) {
-        vkDestroyFramebuffer(_device, buffer, nullptr);
+    for (std::uint32_t i = 0; i < max_frames_in_flight; ++i) {
+        vkDestroySemaphore(_device, _image_available_semaphores[i], nullptr);
+        vkDestroySemaphore(_device, _render_finished_semaphores[i], nullptr);
+        vkDestroyFence(_device, _inflight_fences[i], nullptr);
     }
+
+    vkDestroyCommandPool(_device, _command_pool, nullptr);
 
     vkDestroyPipeline(_device, _pipeline, nullptr);
     vkDestroyPipelineLayout(_device, _pipeline_layout, nullptr);
     vkDestroyRenderPass(_device, _render_pass, nullptr);
 
-    for (auto view : _image_views) {
-        vkDestroyImageView(_device, view, nullptr);
-    }
-
-    vkDestroySwapchainKHR(_device, _swapchain, nullptr);
     vkDestroyDevice(_device, nullptr);
 #ifndef NDEBUG
     DestroyDebugUtilsMessengerEXT(_instance, _dbg_messenger);
@@ -670,20 +589,178 @@ auto Motorino::Engine::create_pipeline(
 auto Motorino::Engine::run() -> void {
     while (!glfwWindowShouldClose(_handle)) {
         glfwPollEvents();
-        draw_frame();
+        if (!draw_frame()) {
+            std::print("Fatal error while rendering frame. Stopping.\n");
+            return;
+        }
     }
 
     vkDeviceWaitIdle(_device);
 }
 
+auto Motorino::Engine::set_extent(
+    std::uint32_t width,
+    std::uint32_t height
+) -> void {
+    _width = width;
+    _height = height;
+}
+
+auto Motorino::Engine::create_swapchain() -> std::expected<void, Error> {
+    VkSurfaceCapabilitiesKHR surface_capabilities;
+
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        _physical_device,
+        _surface,
+        &surface_capabilities
+    );
+
+    bool should_clamp = surface_capabilities.maxImageCount > 0 &&
+        surface_capabilities.minImageCount + 1 > surface_capabilities.maxImageCount;
+
+    std::uint32_t image_count = should_clamp ? surface_capabilities.maxImageCount :
+                                               surface_capabilities.minImageCount + 1;
+
+    std::uint32_t index_values[] = { *_indices.graphics, *_indices.present };
+
+    VkSwapchainCreateInfoKHR swapchain_info{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = _surface,
+        .minImageCount = image_count,
+        .imageFormat = VK_FORMAT_R8G8B8A8_SRGB,
+        .imageColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR,
+        .imageExtent = surface_capabilities.currentExtent,
+        .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .preTransform = surface_capabilities.currentTransform,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        .presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
+        .clipped = VK_TRUE,
+        .oldSwapchain = VK_NULL_HANDLE
+    };
+
+    if (index_values[0] != index_values[1]) {
+        swapchain_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        swapchain_info.queueFamilyIndexCount = 2;
+        swapchain_info.pQueueFamilyIndices = index_values;
+    }
+    else {
+        swapchain_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    }
+
+    if (vkCreateSwapchainKHR(_device, &swapchain_info, nullptr, &_swapchain) != VK_SUCCESS) {
+        std::print("Failed to create Vulkan swapchain.\n");
+        return std::unexpected(Error::vulkan);
+    }
+
+    vkGetSwapchainImagesKHR(_device, _swapchain, &image_count, nullptr);
+    
+    _images.resize(image_count);
+    vkGetSwapchainImagesKHR(_device, _swapchain, &image_count, _images.data());
+
+    std::print(
+        "Created Vulkan swapchain ({},{},{}).\n",
+        surface_capabilities.currentExtent.width,
+        surface_capabilities.currentExtent.height,
+        image_count
+    );
+
+    return {};
+}
+
+auto Motorino::Engine::create_image_views() -> std::expected<void, Error> {
+    _image_views.resize(_images.size());
+
+    VkImageViewCreateInfo view_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .components = { VK_COMPONENT_SWIZZLE_IDENTITY,
+                        VK_COMPONENT_SWIZZLE_IDENTITY,
+                        VK_COMPONENT_SWIZZLE_IDENTITY,
+                        VK_COMPONENT_SWIZZLE_IDENTITY },
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+    };
+
+    for (std::size_t i = 0; i < _images.size(); ++i) {
+        view_info.image = _images[i];
+
+        if (vkCreateImageView(_device, &view_info, nullptr, &_image_views[i]) != VK_SUCCESS) {
+            std::print("Failed to obtain Vulkan image view.\n");
+            return std::unexpected(Error::vulkan);
+        }
+    }
+
+    std::print("Created Vulkan image views.\n");
+    return {};
+}
+
+auto Motorino::Engine::create_framebuffers() -> std::expected<void, Error> {
+    _framebuffers.resize(_images.size());
+
+    for (std::size_t i = 0; i < _image_views.size(); ++i) {
+        VkFramebufferCreateInfo framebuffer_info{
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = _render_pass,
+            .attachmentCount = 1,
+            .pAttachments = &_image_views[i],
+            .width = _width,
+            .height = _height,
+            .layers = 1
+        };
+
+        if (vkCreateFramebuffer(_device, &framebuffer_info, nullptr, &_framebuffers[i]) != VK_SUCCESS) {
+            std::print("Failed to create Vulkan framebuffer.\n");
+            return std::unexpected(Error::vulkan);
+        }
+    }
+
+    std::print("Created {} framebuffers.\n", _framebuffers.size());
+    return {};
+}
+
+auto Motorino::Engine::cleanup_swapchain() -> void {
+    for (auto buffer : _framebuffers) {
+        vkDestroyFramebuffer(_device, buffer, nullptr);
+    }
+
+    for (auto view : _image_views) {
+        vkDestroyImageView(_device, view, nullptr);
+    }
+
+    vkDestroySwapchainKHR(_device, _swapchain, nullptr);
+}
+
+auto Motorino::Engine::recreate_swapchain() -> std::expected<void, Error> {
+    int width = 0;
+    int height = 0;
+    glfwGetFramebufferSize(_handle, &width, &height);
+
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(_handle, &width, &height);
+        glfwWaitEvents();
+    }
+
+    vkDeviceWaitIdle(_device);
+ 
+    cleanup_swapchain();
+
+    create_swapchain();
+    create_image_views();
+    create_framebuffers();
+
+    return {};
+}
+
 auto Motorino::Engine::record_command_buffer(
-    std::uint32_t index
+    std::uint32_t current_frame,
+    std::uint32_t image_index
 ) -> void {
     constexpr VkCommandBufferBeginInfo begin_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     };
 
-    if (vkBeginCommandBuffer(_command_buffer, &begin_info) != VK_SUCCESS) {
+    if (vkBeginCommandBuffer(_command_buffers[current_frame], &begin_info) != VK_SUCCESS) {
         std::print("Failed to begin recording command buffer.\n");
         return;
     }
@@ -693,14 +770,23 @@ auto Motorino::Engine::record_command_buffer(
     VkRenderPassBeginInfo pass_info{
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = _render_pass,
-        .framebuffer = _framebuffers[index],
+        .framebuffer = _framebuffers[image_index],
         .renderArea = {.offset = {0,0}, .extent = {_width, _height}},
         .clearValueCount = 1,
         .pClearValues = &clear_value
     };
 
-    vkCmdBeginRenderPass(_command_buffer, &pass_info, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+    vkCmdBeginRenderPass(
+        _command_buffers[current_frame],
+        &pass_info,
+        VK_SUBPASS_CONTENTS_INLINE
+    );
+
+    vkCmdBindPipeline(
+        _command_buffers[current_frame],
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        _pipeline
+    );
 
     VkViewport viewport{
         .x = 0.0f,
@@ -710,56 +796,72 @@ auto Motorino::Engine::record_command_buffer(
         .minDepth = 0.0f,
         .maxDepth = 1.0f,
     };
-    vkCmdSetViewport(_command_buffer, 0, 1, &viewport);
+    vkCmdSetViewport(_command_buffers[current_frame], 0, 1, &viewport);
 
     VkRect2D scissor{
         .offset = {0, 0},
         .extent = {_width, _height}
     };
-    vkCmdSetScissor(_command_buffer, 0, 1, &scissor);
+    vkCmdSetScissor(_command_buffers[current_frame], 0, 1, &scissor);
 
-    vkCmdDraw(_command_buffer, 3, 1, 0, 0);
-    vkCmdEndRenderPass(_command_buffer);
+    vkCmdDraw(_command_buffers[current_frame], 3, 1, 0, 0);
+    vkCmdEndRenderPass(_command_buffers[current_frame]);
 
-    if (vkEndCommandBuffer(_command_buffer) != VK_SUCCESS) {
+    if (vkEndCommandBuffer(_command_buffers[current_frame]) != VK_SUCCESS) {
         std::print("Failed to finish recording command buffer.\n");
         return;
     }
 }
 
-auto Motorino::Engine::draw_frame() -> void {
-    vkWaitForFences(_device, 1, &_inflight_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(_device, 1, &_inflight_fence);
-    
+auto Motorino::Engine::draw_frame() -> std::expected<void, Error> {
+    static std::uint32_t current_frame = 0;
+
+    vkWaitForFences(
+        _device,
+        1,
+        &_inflight_fences[current_frame],
+        VK_TRUE, UINT64_MAX
+    );
+
     std::uint32_t image_index;
-    vkAcquireNextImageKHR(
+    VkResult result = vkAcquireNextImageKHR(
         _device,
         _swapchain,
         UINT64_MAX,
-        _image_available_semaphore,
+        _image_available_semaphores[current_frame],
         VK_NULL_HANDLE,
         &image_index
     );
 
-    vkResetCommandBuffer(_command_buffer, 0);
-    record_command_buffer(image_index);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreate_swapchain();
+        return {};
+    }
+    else if(result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        std::print("Failed to acquire a swapchain image.\n");
+        return std::unexpected(Error::vulkan);
+    }
 
-    VkSemaphore wait_semaphores[] = { _image_available_semaphore };
-    VkSemaphore signal_semaphores[] = { _render_finished_semaphore };
-    constexpr VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    vkResetFences(_device, 1, &_inflight_fences[current_frame]);
+    vkResetCommandBuffer(_command_buffers[current_frame], 0);
+    record_command_buffer(current_frame, image_index);
+
+    constexpr VkPipelineStageFlags wait_stages[] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    };
 
     VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = array_size(wait_semaphores),
-        .pWaitSemaphores = wait_semaphores,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &_image_available_semaphores[current_frame],
         .pWaitDstStageMask = wait_stages,
         .commandBufferCount = 1,
-        .pCommandBuffers = &_command_buffer,
-        .signalSemaphoreCount = array_size(signal_semaphores),
-        .pSignalSemaphores = signal_semaphores
+        .pCommandBuffers = &_command_buffers[current_frame],
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &_render_finished_semaphores[current_frame]
     };
 
-    if (vkQueueSubmit(_graphics_queue, 1, &submit_info, _inflight_fence) != VK_SUCCESS) {
+    if (vkQueueSubmit(_graphics_queue, 1, &submit_info, _inflight_fences[current_frame]) != VK_SUCCESS) {
         std::print("Failed to submit draw command buffer.\n");
     }
 
@@ -767,12 +869,23 @@ auto Motorino::Engine::draw_frame() -> void {
 
     VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount = array_size(signal_semaphores),
-        .pWaitSemaphores = signal_semaphores,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &_render_finished_semaphores[current_frame],
         .swapchainCount = array_size(swap_chains),
         .pSwapchains = swap_chains,
         .pImageIndices = &image_index
     };
 
-    vkQueuePresentKHR(_present_queue, &present_info);
+    result = vkQueuePresentKHR(_present_queue, &present_info);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        recreate_swapchain();
+    }
+    else if(result != VK_SUCCESS) {
+        std::print("Failed to present swap chain image.\n");
+        return std::unexpected(Error::vulkan);
+    }
+
+    current_frame = (current_frame + 1) % max_frames_in_flight;
+    return {};
 }

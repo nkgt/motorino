@@ -45,6 +45,8 @@ struct ShaderInfo {
     std::filesystem::path path;
 };
 
+constexpr std::uint32_t max_frames_in_flight = 2;
+
 enum class Error {
     vulkan,
     shader_compilation
@@ -60,15 +62,25 @@ public:
     ~Engine();
 
     auto init_vulkan() -> std::expected<void, Error>;
+    auto set_extent(
+        std::uint32_t width,
+        std::uint32_t height
+    ) -> void;
     auto create_pipeline(std::span<ShaderInfo> shaders) -> std::expected<void, Error>;
+    auto recreate_swapchain() -> std::expected<void, Error>;
     auto run() -> void;
 
 private:
+    auto create_swapchain() -> std::expected<void, Error>;
+    auto cleanup_swapchain() -> void;
+    auto create_image_views() -> std::expected<void, Error>;
+    auto create_framebuffers() -> std::expected<void, Error>;
     auto record_command_buffer(
+        std::uint32_t current_frame,
         std::uint32_t image_index
     ) -> void;
 
-    auto draw_frame() -> void;
+    auto draw_frame() -> std::expected<void, Error>;
 
     std::uint32_t _width;
     std::uint32_t _height;
@@ -86,12 +98,12 @@ private:
     VkSwapchainKHR _swapchain;
     VkRenderPass _render_pass;
     VkCommandPool _command_pool;
-    VkCommandBuffer _command_buffer;
+    VkCommandBuffer _command_buffers[max_frames_in_flight];
     VkPipelineLayout _pipeline_layout;
     VkPipeline _pipeline;
-    VkSemaphore _image_available_semaphore;
-    VkSemaphore _render_finished_semaphore;
-    VkFence _inflight_fence;
+    VkSemaphore _image_available_semaphores[max_frames_in_flight];
+    VkSemaphore _render_finished_semaphores[max_frames_in_flight];
+    VkFence _inflight_fences[max_frames_in_flight];
     std::vector<VkImage> _images;
     std::vector<VkImageView> _image_views;
     std::vector<VkFramebuffer> _framebuffers;
