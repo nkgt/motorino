@@ -3,6 +3,7 @@
     "name": "motorino",
     "version": "0.0.0",
     "dependencies": [
+      "fmt",
       "glfw3"
     ]
   }
